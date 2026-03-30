@@ -873,7 +873,7 @@ def print_quality_report(data: list[str]) -> None:
 if __name__ == "__main__":
     TARGET = 1200
     SEED   = 42
-    OUTPUT = "/mnt/user-data/outputs/luganda_train.txt"
+    OUTPUT = "luganda_train.txt"
 
     print(f"Luganda Dataset Factory v2.0  —  target={TARGET}, seed={SEED}\n")
     data = generate_dataset(TARGET, SEED)
