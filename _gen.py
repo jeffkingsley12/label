@@ -1,32 +1,35 @@
 """
-Luganda FastText Training Data Generator  ─  v2.0
+Luganda FastText Training Data Generator  ─  v2.1
 ==================================================
-Upgrades over v1.0:
-  • LugandaElisionHandler (bidirectional, vowel-harmony-safe) replaces ad-hoc regex
-  • inject_noise()   : dirty-input layer (slang, lowercase, punct-drop, code-switch)
-  • random_phone()   : dynamic phone numbers — no fixed-list overfitting
-  • __label__oos     : out-of-scope hard-negatives → prevents catastrophic misclassification
-  • Quality metrics  : vocabulary size, avg sentence length, label entropy
-
-Still retained from v1.0:
-  • Seeded RNG → full reproducibility
-  • Per-label quota generation → exact distribution control
-  • Bounded attempt loop → no infinite hang
-  • fill_slots() KeyError guard → template typo safety
+Fixes over v2.0:
+  • [CRITICAL] OOS quota > unique templates crash — early-return path via rng.sample()
+  • [CRITICAL] amt_pair[1] was dead data — exposed as {amt_w_num} slot
+  • [MEDIUM]   _compute_quotas() now returns dict[str,int] — eliminates positional coupling
+  • [MEDIUM]   inject_noise() step order fixed: code-switch before lowercase (avoids mixed-case artefact)
+  • [MEDIUM]   Slang replacement uses single combined alternation regex (O(n) not O(15n))
+  • [MEDIUM]   generate_for_label() stall detection — fails fast instead of busy-looping
+  • [MEDIUM]   Template pre-validation at import time (_validate_templates)
+  • [MINOR]    All probability magic numbers moved to Config
+  • [MINOR]    greet_r dead slot removed from fill_slots()
+  • [MINOR]    assert replaced with explicit if/raise (safe under python -O)
+  • [MINOR]    argparse wired to __main__ — no source edits needed for common params
+  • [MINOR]    File write wrapped in try/except OSError
+  • [MINOR]    print_quality_report() rewritten as a single pass over data
 """
 
+import argparse
 import math
 import random
 import re
 from collections import Counter
+from typing import NamedTuple
 
 # ── Local linguistic module ────────────────────────────────────────────────────
-# elision.py must live in the same directory as this script.
 try:
     from elision import LugandaElisionHandler
 except ImportError as exc:
     raise ImportError(
-        "elision.py not found. Place it in the same directory as generate_luganda.py."
+        "elision.py not found. Place it in the same directory as _gen.py."
     ) from exc
 
 # Instantiate once — compiled regex patterns inside are reused for every call.
@@ -34,28 +37,59 @@ _ELISION = LugandaElisionHandler()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 0.  CONFIGURATION  (all tuneable constants in one place)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Config:
+    """Central home for every magic number in the pipeline."""
+    # Morphological elision
+    ELISION_PROB:      float = 0.35   # fraction of lines that get elision applied
+    ELISION_SPLIT:     float = 0.50   # within elision: P(contract) vs P(expand)
+
+    # Noise injection
+    NOISE_PROB:        float = 0.20   # fraction of lines that receive noise
+    LOWERCASE_PROB:    float = 0.30   # sub-chance: full lowercase
+    PUNCT_DROP_PROB:   float = 0.30   # sub-chance: strip trailing punctuation
+    CODE_SWITCH_PROB:  float = 0.20   # sub-chance: one Luganda verb → English
+
+    # Generation engine
+    MAX_ATTEMPT_MULT:  int   = 300    # max_attempts = quota * MAX_ATTEMPT_MULT
+    STALL_LIMIT_MULT:  int   = 10     # stall break = min(500, quota * STALL_LIMIT_MULT)
+    STALL_LIMIT_CAP:   int   = 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 1.  LEXICON
 # ══════════════════════════════════════════════════════════════════════════════
 
-AMOUNTS = [
+class AmountPair(NamedTuple):
+    """
+    word:    Luganda word form  (used by {amt_w})
+    numeric: digit string       (used by {amt_w_num} — paired literal for the word)
+    """
+    word:    str
+    numeric: str
+
+
+AMOUNTS: list[AmountPair] = [
     # Hundreds
-    ("ebikumi bibiri",           "200"),
-    ("ebikumi bisatu",           "300"),
-    ("ebikumi bitaano",          "500"),
-    ("ekikumi",                  "100"),
+    AmountPair("ebikumi bibiri",           "200"),
+    AmountPair("ebikumi bisatu",           "300"),
+    AmountPair("ebikumi bitaano",          "500"),
+    AmountPair("ekikumi",                  "100"),
     # Thousands
-    ("emitwalo ebiri",           "2000"),
-    ("emitwalo esatu",           "3000"),
-    ("emitwalo etaano",          "5000"),
-    ("emitwalo kkumi",           "10000"),
-    ("emitwalo kkumi n'etaano",  "15000"),
-    ("emitwalo makumi abiri",    "20000"),
-    ("emitwalo makumi asatu",    "30000"),
-    ("emitwalo makumi ataano",   "50000"),
+    AmountPair("emitwalo ebiri",           "2000"),
+    AmountPair("emitwalo esatu",           "3000"),
+    AmountPair("emitwalo etaano",          "5000"),
+    AmountPair("emitwalo kkumi",           "10000"),
+    AmountPair("emitwalo kkumi n'etaano",  "15000"),
+    AmountPair("emitwalo makumi abiri",    "20000"),
+    AmountPair("emitwalo makumi asatu",    "30000"),
+    AmountPair("emitwalo makumi ataano",   "50000"),
     # Millions
-    ("omutwalo gumu",            "1000000"),
-    ("emitwalo egiri",           "2000000"),
-    ("emirundi esatu",           "3000000"),
+    AmountPair("omutwalo gumu",            "1000000"),
+    AmountPair("emitwalo egiri",           "2000000"),
+    AmountPair("emirundi esatu",           "3000000"),
 ]
 
 NUMERIC_AMOUNTS = [
@@ -584,6 +618,10 @@ TEMPLATES: dict[str, list[str]] = {
         "Where can I buy fresh vegetables?",
         "Tell me about the history of Kampala.",
         "What is the temperature outside?",
+        "Who won the football match yesterday?",   # extra lines so OOS quota ≥ 60
+        "How do I charge my laptop faster?",
+        "What channels are on DStv tonight?",
+        "Can you set a reminder for me?",
     ],
 }
 
@@ -600,14 +638,19 @@ LABEL_WEIGHTS: dict[str, float] = {
     "__label__fdb_pos":       0.05,
     "__label__oos":           0.05,
 }
-assert abs(sum(LABEL_WEIGHTS.values()) - 1.0) < 1e-9, \
-    f"LABEL_WEIGHTS must sum to 1.0, got {sum(LABEL_WEIGHTS.values()):.6f}"
 
-# Every label must have templates and every template bank must have a weight.
+# ── Invariant guards (explicit raises — safe under python -O, unlike assert) ──
+if abs(sum(LABEL_WEIGHTS.values()) - 1.0) >= 1e-9:
+    raise ValueError(
+        f"LABEL_WEIGHTS must sum to 1.0, got {sum(LABEL_WEIGHTS.values()):.6f}"
+    )
+
 _missing_templates = set(LABEL_WEIGHTS) - set(TEMPLATES)
 _missing_weights   = set(TEMPLATES)     - set(LABEL_WEIGHTS)
-assert not _missing_templates, f"No templates for labels: {_missing_templates}"
-assert not _missing_weights,   f"No weight assigned for labels: {_missing_weights}"
+if _missing_templates:
+    raise ValueError(f"No templates for labels: {_missing_templates}")
+if _missing_weights:
+    raise ValueError(f"No weight assigned for labels: {_missing_weights}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -631,7 +674,28 @@ def random_phone(rng: random.Random) -> str:
 def fill_slots(template: str, rng: random.Random) -> str:
     """
     Resolve all {slot} references in `template`.
-    Raises ValueError on unknown slots (catches typos at generation time, not silently).
+
+    Slot catalogue:
+      {amt_w}      — Luganda word form of a sampled amount  ("emitwalo kkumi")
+      {amt_w_num}  — Digit string paired with {amt_w}       ("10000")
+      {amt_n}      — Independently sampled numeric amount   ("7500")
+      {person}     — A kinship / social role term
+      {phone}      — Dynamically generated Ugandan phone number
+      {provider}   — Mobile money / bank name
+      {bill}       — Bill or fee type
+      {account}    — Account descriptor (may contain sub-slot {provider})
+      {ui}         — UI element name
+      {item}       — General information noun
+      {q}          — Question word
+      {greet_g}    — General greeting phrase
+      {greet_m}    — Morning greeting phrase
+      {polite}     — Politeness particle
+      {problem}    — Problem description phrase
+      {pos_adj}    — Positive adjective phrase
+      {neg_adj}    — Negative adjective phrase
+
+    Raises ValueError on unknown slot names (catches template typos at
+    generation time rather than silently producing malformed lines).
     """
     amt_pair = rng.choice(AMOUNTS)
 
@@ -644,23 +708,24 @@ def fill_slots(template: str, rng: random.Random) -> str:
     )
 
     slots: dict[str, str] = {
-        "amt_w":    amt_pair[0],
-        "amt_n":    rng.choice(NUMERIC_AMOUNTS),
-        "person":   rng.choice(PEOPLE),
-        "phone":    random_phone(rng),
-        "provider": rng.choice(PROVIDERS),
-        "bill":     rng.choice(BILL_TYPES),
-        "account":  account_str,
-        "ui":       rng.choice(UI_ELEMENTS),
-        "item":     rng.choice(ITEMS_INFO),
-        "q":        rng.choice(Q_WORDS),
-        "greet_g":  rng.choice(GREETINGS_GENERAL),
-        "greet_m":  rng.choice(GREETINGS_MORNING),
-        "greet_r":  rng.choice(GREETINGS_RESPONSE),
-        "polite":   rng.choice(POLITENESS),
-        "problem":  rng.choice(PROBLEMS),
-        "pos_adj":  rng.choice(POSITIVE_ADJ),
-        "neg_adj":  rng.choice(NEGATIVE_ADJ),
+        "amt_w":     amt_pair.word,
+        "amt_w_num": amt_pair.numeric,   # FIX: was dead data (amt_pair[1]); now exposed
+        "amt_n":     rng.choice(NUMERIC_AMOUNTS),
+        "person":    rng.choice(PEOPLE),
+        "phone":     random_phone(rng),
+        "provider":  rng.choice(PROVIDERS),
+        "bill":      rng.choice(BILL_TYPES),
+        "account":   account_str,
+        "ui":        rng.choice(UI_ELEMENTS),
+        "item":      rng.choice(ITEMS_INFO),
+        "q":         rng.choice(Q_WORDS),
+        "greet_g":   rng.choice(GREETINGS_GENERAL),
+        "greet_m":   rng.choice(GREETINGS_MORNING),
+        # greet_r removed — was defined but never referenced in any template
+        "polite":    rng.choice(POLITENESS),
+        "problem":   rng.choice(PROBLEMS),
+        "pos_adj":   rng.choice(POSITIVE_ADJ),
+        "neg_adj":   rng.choice(NEGATIVE_ADJ),
     }
     try:
         return template.format(**slots)
@@ -670,84 +735,103 @@ def fill_slots(template: str, rng: random.Random) -> str:
         ) from exc
 
 
+# ── Template pre-validation (runs once at import; surfaces typos immediately) ─
+def _validate_templates() -> None:
+    dummy_rng = random.Random(0)
+    for label, tmpl_list in TEMPLATES.items():
+        if label == "__label__oos":
+            continue
+        for tmpl in tmpl_list:
+            try:
+                fill_slots(tmpl, dummy_rng)
+            except (ValueError, KeyError) as exc:
+                raise AssertionError(
+                    f"Bad template in {label}: {exc}\n  → '{tmpl}'"
+                ) from exc
+
+_validate_templates()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 5.  ELISION LAYER  (bidirectional via LugandaElisionHandler)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def apply_elision(text: str, rng: random.Random, probability: float = 0.35) -> str:
+def apply_elision(text: str, rng: random.Random,
+                  probability: float = Config.ELISION_PROB) -> str:
     """
     Randomly applies one of three elision states:
 
       contracted (reconstruct_elisions) — formal texting style, e.g. "y'emmere"
       expanded   (expand_elisions)      — spoken/canonical style, e.g. "ya emmere"
-      unchanged                         — plain/neutral form
+      unchanged                         — plain/neutral form (~65 % of calls)
 
-    The probability budget is split equally across the two active transforms so
-    both morphological variants appear at similar rates in training data.
+    LugandaElisionHandler is stateless and thread-safe after __init__.
+    The probability budget is split 50/50 between the two active transforms,
+    so each variant appears at rate (probability × 0.5) in training data.
     """
     if rng.random() > probability:
-        return text  # ~65 % pass-through
+        return text
 
-    if rng.random() < 0.5:
-        return _ELISION.reconstruct_elisions(text)   # contract eligible particles
+    if rng.random() < Config.ELISION_SPLIT:
+        return _ELISION.reconstruct_elisions(text)
     else:
-        return _ELISION.expand_elisions(text)         # expand existing contractions
+        return _ELISION.expand_elisions(text)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6.  NOISE INJECTION LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Pre-compiled slang patterns (whole-word match, sorted longest-number-first
-# so "50000" → "50k" is never shadowed by a shorter prefix match).
-_SLANG_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(rf"\b{re.escape(num)}\b"), slang)
-    for num, slang in sorted(NUMERIC_SLANG.items(), key=lambda kv: -len(kv[0]))
+# Single combined alternation regex — O(n) replacement instead of O(15·n).
+# Keys sorted longest-first so "50000" is never shadowed by a shorter prefix.
+_SLANG_RE: re.Pattern = re.compile(
+    r'\b(' + '|'.join(
+        re.escape(k) for k in sorted(NUMERIC_SLANG, key=len, reverse=True)
+    ) + r')\b'
+)
+
+# Pre-compiled per-word code-switch patterns (still used one-at-a-time for
+# first-match semantics, but compiled at module load not per call).
+_CODE_SWITCH_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(rf"\b{re.escape(lug)}\b", re.IGNORECASE), eng)
+    for lug, eng in CODE_SWITCH_MAP.items()
 ]
 
 
-def inject_noise(text: str, rng: random.Random, probability: float = 0.20) -> str:
+def inject_noise(text: str, rng: random.Random,
+                 probability: float = Config.NOISE_PROB) -> str:
     """
     Simulate real-world dirty input with `probability` (default 20 %).
 
-    Transformations applied independently once noise is triggered:
+    Step order (important — code-switch runs BEFORE lowercase so that English
+    replacements are not left title-cased inside an otherwise all-lowercase line):
 
-      Numeric slang  — "5000" → "5k"          (always, when numbers present)
-      Lowercase      — "Sindiika" → "sindiika"  (30 % sub-chance)
-      Punct drop     — strip trailing ".?!"      (30 % sub-chance)
-      Code-switch    — Luganda verb → English    (20 % sub-chance, one word only)
-
-    Combinations emerge naturally because each transformation is independent,
-    giving the model exposure to e.g. "send 5k eri mama" from training.
+      1. Numeric slang   — "5000" → "5k"          (always, when numbers present)
+      2. Code-switch     — Luganda verb → English   (20 % sub-chance, one word)
+      3. Lowercase       — "Sindiika" → "sindiika"  (30 % sub-chance)
+      4. Punct drop      — strip trailing ".?!"      (30 % sub-chance)
     """
     if rng.random() > probability:
         return text
 
-    # 1. Numeric slang
-    for pattern, slang in _SLANG_PATTERNS:
-        text = pattern.sub(slang, text)
+    # 1. Numeric slang (single-pass combined regex)
+    text = _SLANG_RE.sub(lambda m: NUMERIC_SLANG[m.group(0)], text)
 
-    # 2. Lowercase
-    if rng.random() < 0.30:
-        text = text.lower()
-
-    # 3. Drop trailing punctuation
-    if rng.random() < 0.30:
-        text = text.rstrip(".?!")
-
-    # 4. Code-switch one verb (first match wins; only one switch per line)
-    if rng.random() < 0.20:
-        for luganda_word, english_word in CODE_SWITCH_MAP.items():
-            replaced = re.sub(
-                rf"\b{re.escape(luganda_word)}\b",
-                english_word,
-                text,
-                count=1,
-                flags=re.IGNORECASE,
-            )
+    # 2. Code-switch one verb BEFORE lowercasing (avoids mixed-case artefact)
+    if rng.random() < Config.CODE_SWITCH_PROB:
+        for pattern, english_word in _CODE_SWITCH_PATTERNS:
+            replaced = pattern.sub(english_word, text, count=1)
             if replaced != text:
                 text = replaced
                 break
+
+    # 3. Lowercase (applied after code-switch so casing is consistent)
+    if rng.random() < Config.LOWERCASE_PROB:
+        text = text.lower()
+
+    # 4. Drop trailing punctuation
+    if rng.random() < Config.PUNCT_DROP_PROB:
+        text = text.rstrip(".?!")
 
     return text
 
@@ -760,39 +844,62 @@ def generate_for_label(label: str, quota: int, rng: random.Random) -> list[str]:
     """
     Generate exactly `quota` unique lines for one label.
 
-    OOS lines skip elision and noise injection — applying Luganda morphological
-    transforms to English/nonsense text would corrupt both meaning and coverage.
+    OOS lines are verbatim strings — elision and noise are skipped to avoid
+    corrupting English/nonsense text with Luganda morphological transforms.
+    OOS is handled via rng.sample() which is O(quota) and guarantees uniqueness
+    without any retry loop, while also enforcing quota ≤ pool size at runtime.
     """
-    is_oos       = label == "__label__oos"
+    templates = TEMPLATES[label]
+
+    # ── Fast path: OOS verbatim strings ───────────────────────────────────────
+    if label == "__label__oos":
+        pool = [f"{label} {t}" for t in templates]
+        if quota > len(pool):
+            raise RuntimeError(
+                f"[{label}] OOS quota ({quota}) exceeds the number of unique "
+                f"verbatim templates ({len(pool)}).\n"
+                f"  → Add at least {quota - len(pool)} more OOS template(s)."
+            )
+        return rng.sample(pool, quota)
+
+    # ── Normal path: slot-filled + elision + noise ────────────────────────────
     bucket:      set[str] = set()
-    max_attempts = quota * 300
+    max_attempts = quota * Config.MAX_ATTEMPT_MULT
+    stall_limit  = min(Config.STALL_LIMIT_CAP, quota * Config.STALL_LIMIT_MULT)
     attempts     = 0
-    templates    = TEMPLATES[label]
+    stall        = 0
 
     while len(bucket) < quota and attempts < max_attempts:
         attempts += 1
+        prev_size = len(bucket)
+
         template = rng.choice(templates)
         text     = fill_slots(template, rng)
-
-        if not is_oos:
-            text = apply_elision(text, rng)
-            text = inject_noise(text, rng)
-
+        text     = apply_elision(text, rng)
+        text     = inject_noise(text, rng)
         bucket.add(f"{label} {text}")
+
+        if len(bucket) == prev_size:
+            stall += 1
+            if stall >= stall_limit:
+                break        # collision ceiling reached — fail fast
+        else:
+            stall = 0
 
     if len(bucket) < quota:
         raise RuntimeError(
             f"[{label}] Generated only {len(bucket)}/{quota} unique lines "
-            f"after {max_attempts} attempts.\n"
+            f"after {attempts} attempts (stall_limit={stall_limit}).\n"
             f"  → Add more templates or expand lexical variety for this label."
         )
     return list(bucket)
 
 
-def _compute_quotas(target_count: int) -> list[int]:
+def _compute_quotas(target_count: int) -> dict[str, int]:
     """
-    Compute per-label line counts that sum exactly to `target_count`
-    using the largest-remainder (Hamilton) method.
+    Compute per-label line counts that sum exactly to `target_count` using the
+    largest-remainder (Hamilton) method.  Returns a dict[label → count] to make
+    the label↔quota mapping explicit and immune to iteration-order assumptions.
     """
     labels  = list(LABEL_WEIGHTS.keys())
     weights = list(LABEL_WEIGHTS.values())
@@ -801,16 +908,15 @@ def _compute_quotas(target_count: int) -> list[int]:
     by_frac = sorted(range(len(labels)), key=lambda i: -(raw[i] - quotas[i]))
     for i in by_frac[: target_count - sum(quotas)]:
         quotas[i] += 1
-    return quotas
+    return dict(zip(labels, quotas))
 
 
 def generate_dataset(target_count: int = 1200, seed: int = 42) -> list[str]:
     rng    = random.Random(seed)
-    labels = list(LABEL_WEIGHTS.keys())
-    quotas = _compute_quotas(target_count)
+    quotas = _compute_quotas(target_count)   # dict — no positional coupling
 
     all_lines: list[str] = []
-    for label, quota in zip(labels, quotas):
+    for label, quota in quotas.items():
         print(f"  generating {quota:>4} lines  {label} …", flush=True)
         all_lines.extend(generate_for_label(label, quota, rng))
 
@@ -818,49 +924,53 @@ def generate_dataset(target_count: int = 1200, seed: int = 42) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  QUALITY METRICS
+# 8.  QUALITY METRICS  (single pass — avoids iterating data 5+ times)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_quality_report(data: list[str]) -> None:
-    n = len(data)
+    n               = len(data)
+    vocab:  set[str] = set()
+    total_tokens     = 0
+    label_counts:   Counter = Counter()
+    elided           = 0
+    slangy           = 0
+    switched         = 0
+    slang_values     = set(NUMERIC_SLANG.values())
+    switch_values    = set(CODE_SWITCH_MAP.values())
 
-    # Strip label token before tokenising text
-    texts = [line.split(" ", 1)[1] if " " in line else line for line in data]
+    for line in data:
+        label, _, text = line.partition(" ")
+        label_counts[label] += 1
+        tokens = text.lower().split()
+        vocab.update(tokens)
+        total_tokens += len(tokens)
+        if "'" in text:
+            elided += 1
+        if any(s in text for s in slang_values):
+            slangy += 1
+        if any(e in text for e in switch_values):
+            switched += 1
 
-    # ── Vocabulary size ────────────────────────────────────────────────────────
-    vocab: set[str] = set()
-    for t in texts:
-        vocab.update(t.lower().split())
+    avg_len     = total_tokens / n
+    entropy     = -sum((c / n) * math.log2(c / n) for c in label_counts.values())
+    max_entropy = math.log2(len(label_counts))
+
     print(f"\n  Vocabulary size       : {len(vocab):,} unique tokens")
-
-    # ── Average sentence length ────────────────────────────────────────────────
-    avg_len = sum(len(t.split()) for t in texts) / n
     print(f"  Avg sentence length   : {avg_len:.1f} tokens")
-
-    # ── Label distribution + entropy ──────────────────────────────────────────
-    label_counts = Counter(line.split()[0] for line in data)
-    entropy      = -sum((c / n) * math.log2(c / n) for c in label_counts.values())
-    max_entropy  = math.log2(len(label_counts))
     print(
         f"  Label entropy         : {entropy:.3f} bits  "
         f"(max = {max_entropy:.3f} for {len(label_counts)} classes)"
     )
-
     print("\n  Label distribution:")
     for lbl, count in sorted(label_counts.items()):
         pct = count / n * 100
         bar = "█" * int(pct / 2)
         print(f"    {lbl:<32}  {count:>4}  ({pct:5.1f}%)  {bar}")
 
-    # ── Coverage checks ────────────────────────────────────────────────────────
-    elided   = sum(1 for t in texts if "'" in t)
-    slangy   = sum(1 for t in texts if any(s in t for s in NUMERIC_SLANG.values()))
-    switched = sum(1 for t in texts if any(e in t for e in CODE_SWITCH_MAP.values()))
     print(f"\n  Elision coverage      : {elided:>4} lines  ({elided/n*100:.1f}%)")
     print(f"  Numeric slang         : {slangy:>4} lines  ({slangy/n*100:.1f}%)")
     print(f"  Code-switched         : {switched:>4} lines  ({switched/n*100:.1f}%)")
 
-    # ── Duplicate check ────────────────────────────────────────────────────────
     dupes  = n - len(set(data))
     status = "✅" if dupes == 0 else "⚠️ "
     print(f"\n  {status} Duplicates          : {dupes}")
@@ -870,26 +980,52 @@ def print_quality_report(data: list[str]) -> None:
 # 9.  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    TARGET = 1200
-    SEED   = 42
-    OUTPUT = "luganda_train.txt"
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Luganda FastText training data generator v2.1"
+    )
+    parser.add_argument(
+        "--target", type=int, default=1200,
+        help="Total number of training lines to generate (default: 1200)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="RNG seed for full reproducibility (default: 42)"
+    )
+    parser.add_argument(
+        "--output", default="luganda_train.txt",
+        help="Output file path (default: luganda_train.txt)"
+    )
+    return parser.parse_args()
 
-    print(f"Luganda Dataset Factory v2.0  —  target={TARGET}, seed={SEED}\n")
+
+if __name__ == "__main__":
+    args = _parse_args()
+
+    TARGET = args.target
+    SEED   = args.seed
+    OUTPUT = args.output
+
+    print(f"Luganda Dataset Factory v2.1  —  target={TARGET}, seed={SEED}\n")
     data = generate_dataset(TARGET, SEED)
 
     # Final shuffle with a different seed to decorrelate from per-label order
     rng = random.Random(SEED + 1)
     rng.shuffle(data)
 
-    with open(OUTPUT, "w", encoding="utf-8") as f:
-        for line in data:
-            f.write(line + "\n")
+    try:
+        with open(OUTPUT, "w", encoding="utf-8") as f:
+            for line in data:
+                f.write(line + "\n")
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to write output to '{OUTPUT}': {exc}"
+        ) from exc
 
     print(f"\n✅ Written {len(data)} lines → {OUTPUT}")
     print_quality_report(data)
     print(
         "\nNext step:\n"
-        "  fasttext supervised -input luganda_train.txt -output model_luganda \\\n"
+        f"  fasttext supervised -input {OUTPUT} -output model_luganda \\\n"
         "    -wordNgrams 2 -minCount 1 -epoch 25 -lr 0.5\n"
     )
