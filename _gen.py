@@ -1,20 +1,34 @@
-"""
-Luganda FastText Training Data Generator  ─  v2.1
+    """
+Luganda FastText Training Data Generator  ─  v2.2
 ==================================================
-Fixes over v2.0:
-  • [CRITICAL] OOS quota > unique templates crash — early-return path via rng.sample()
-  • [CRITICAL] amt_pair[1] was dead data — exposed as {amt_w_num} slot
-  • [MEDIUM]   _compute_quotas() now returns dict[str,int] — eliminates positional coupling
-  • [MEDIUM]   inject_noise() step order fixed: code-switch before lowercase (avoids mixed-case artefact)
-  • [MEDIUM]   Slang replacement uses single combined alternation regex (O(n) not O(15n))
-  • [MEDIUM]   generate_for_label() stall detection — fails fast instead of busy-looping
-  • [MEDIUM]   Template pre-validation at import time (_validate_templates)
-  • [MINOR]    All probability magic numbers moved to Config
-  • [MINOR]    greet_r dead slot removed from fill_slots()
-  • [MINOR]    assert replaced with explicit if/raise (safe under python -O)
-  • [MINOR]    argparse wired to __main__ — no source edits needed for common params
-  • [MINOR]    File write wrapped in try/except OSError
-  • [MINOR]    print_quality_report() rewritten as a single pass over data
+Refinements over v2.1 (boundary-hardening + ontology enrichment):
+
+  [BOUNDARY]  Verb-crossed templates added to trx_transfer and trx_payment so
+              the model learns to discriminate on Recipient (person vs. bill)
+              rather than on surface verb (Sasula / Sindiika / Weereza).
+              "Sasula maama 10k" will no longer default to trx_payment.
+
+  [ONTOLOGY]  BILL_TYPES enhanced with biller codes, meter numbers ({meter}),
+              and paybill patterns ({provider}).  The {meter} sub-slot is
+              pre-resolved inside fill_slots() — same pattern as {account}.
+              random_meter() added alongside random_phone().
+
+  [AMOUNTS]   {amt_w} (word-form) now also appears in trx_payment templates
+              so large-amount word forms are not exclusively associated with
+              transfers; amount magnitude is no longer a proxy for intent.
+
+  [OOS]       Mixed Luganda prose (non-financial) added to __label__oos so the
+              model learns "Luganda ≠ financial intent".  OOS was previously
+              100 % English, meaning any Luganda input could never be rejected.
+
+Retained from v2.1:
+  • Config dataclass — single location for all probability constants
+  • _validate_templates() — import-time template typo detection
+  • rng.sample() OOS fast-path — no retry loop, guaranteed uniqueness
+  • _compute_quotas() → dict[str,int] — explicit label↔quota mapping
+  • Stall detection in generate_for_label()
+  • Single-pass quality report
+  • argparse CLI, OSError-guarded file write
 """
 
 import argparse
@@ -117,11 +131,21 @@ PEOPLE = [
 PROVIDERS = ["Airtel", "MTN", "Stanbic", "DFCU", "Centenary", "Equity", "PostBank"]
 
 BILL_TYPES = [
+    # Service descriptions (existing)
     "amayengo g'amazzi",       "amayengo g'amasanye",     "ssuukali",
     "ffiiri y'amasanye",       "ffiiri y'amazzi",          "ffiiri ya NWSC",
     "ffiiri ya Umeme",          "ffene ya ggwanga",         "amateekkwa g'essomero",
     "omusingo gw'ezzukuka",     "amateekkwa g'obusuubuzi",
     "ffiiri ya DStv",           "amateekkwa g'akavuulu",
+    # Biller codes & paybill patterns — include {provider} sub-slot
+    "paybill ya {provider}",
+    "biller code ya {provider}",
+    "till number ya {provider}",
+    # Meter / account number patterns — include {meter} sub-slot
+    "Yaka ya {meter}",
+    "namba ya mita {meter}",
+    "akawunti ya mita {meter}",
+    "namba ya NWSC {meter}",
 ]
 
 ACCOUNTS = [
@@ -227,6 +251,17 @@ TEMPLATES: dict[str, list[str]] = {
         "Fuba okusindiika {amt_w} eri {phone}.",
         "Sindiika {phone} {amt_n} ku {provider}.",
         "Njagala okusindiika {amt_n} eri {person} ku {provider}.",
+        # ── Verb-crossed templates (boundary hardening) ───────────────────────
+        # "Sasula" here targets a PERSON, not a bill — the model must learn that
+        # the discriminating feature is Recipient type, not the surface verb.
+        "Sasula {person} {amt_n}.",
+        "Sasula {person} {amt_w}.",
+        "Njagala okusasula {person} {amt_n}.",
+        "Njagala okusasula {person} {amt_w}.",
+        "Sasula {person} {amt_n} ku {provider}.",
+        "Sasula {phone} {amt_n}.",
+        "Lipirira {person} {amt_n}.",
+        "Lipirira {person} {amt_w}.",
     ],
 
     # ── trx_balance ───────────────────────────────────────────────────────────
@@ -307,6 +342,21 @@ TEMPLATES: dict[str, list[str]] = {
         "Lipirira {bill} ya {provider} mangu.",
         "Sasula {bill} ku {provider} eri {amt_n}.",
         "Nkwagala osasule {bill}.",
+        # ── Verb-crossed templates (boundary hardening) ───────────────────────
+        # "Sindiika/Weereza" here targets a BILL, not a person — forces the model
+        # to look at the object type (institution/service) rather than the verb.
+        "Sindiika {amt_n} eri {bill}.",
+        "Sindiika {amt_w} eri {bill}.",
+        "Weereza {amt_n} eri {bill}.",
+        "Weereza {amt_w} eri {bill}.",
+        "Tuma {amt_n} okuliwa {bill}.",
+        # ── Word-form amounts in payment context ──────────────────────────────
+        # Ensures large word-form amounts (e.g. "emitwalo makumi ataano") are
+        # not exclusively associated with transfers; magnitude ≠ intent proxy.
+        "Sasula {bill} ya {amt_w}.",
+        "Lipirira {bill} ya {amt_w} mangu.",
+        "Fuba okusasula {bill} eri {amt_w}.",
+        "Kola okuliwa {bill} ya {amt_w}.",
     ],
 
     # ── soc_greeting ──────────────────────────────────────────────────────────
@@ -622,6 +672,30 @@ TEMPLATES: dict[str, list[str]] = {
         "How do I charge my laptop faster?",
         "What channels are on DStv tonight?",
         "Can you set a reminder for me?",
+        # ── Luganda non-financial prose ───────────────────────────────────────
+        # Critical addition: OOS was 100% English. Any Luganda utterance was
+        # therefore never rejectable. These lines teach the model that
+        # Luganda ≠ financial intent.
+        "Omwana agenda ku ssomero buli lunaku.",
+        "Ekyotole kya leero kirina obuufu nnyo.",
+        "Nkola ennyo buli lunaku mu ttaka lya taata.",
+        "Abantu bangi bajja ku mutindo guno.",
+        "Emmere ya leero yakolebwa bulungi nnyo.",
+        "Omuzannyo gwa piira gwali omulungi nnyo.",
+        "Ensi ya Uganda ennungi nnyo okusulamu.",
+        "Abeesiga baabuli mu nnyumba eno.",
+        "Ekyuma kino tekikola nga bwe kyetaagibwa.",
+        "Kasuku wa muganda wange ayimba bulungi.",
+        "Katikiro wa Buganda ye Charles Peter Mayiga.",
+        "Leero olunaku lwa Lwakubiri.",
+        "Embaga yaabadde ey'omulungi nnyo.",
+        "These days nina obusungu banange.",
+        "Nze mmanyi okuteekawo emmere bulungi.",
+        "Omwana wange akola bulungi mu ssomero.",
+        "Ebiseera bino byonna ebyokusoma birina omuwendo.",
+        "Omukazi omulungi asoma mu yunivesite.",
+        "Abalimi babadde basima ennyanya mu ttaka.",
+        "Ekitabo kino kirina amakulu amangi nnyo.",
     ],
 }
 
@@ -667,6 +741,15 @@ def random_phone(rng: random.Random) -> str:
     return prefix + digits
 
 
+def random_meter(rng: random.Random) -> str:
+    """
+    Generate a plausible Ugandan utility meter / Yaka token number (8 digits).
+    Used by BILL_TYPES entries that contain the {meter} sub-slot, giving the
+    model exposure to real biller-code patterns without fixed-string overfitting.
+    """
+    return "".join(str(rng.randint(0, 9)) for _ in range(8))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 4.  SLOT FILLER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -681,9 +764,10 @@ def fill_slots(template: str, rng: random.Random) -> str:
       {amt_n}      — Independently sampled numeric amount   ("7500")
       {person}     — A kinship / social role term
       {phone}      — Dynamically generated Ugandan phone number
+      {meter}      — 8-digit utility meter / Yaka token number
       {provider}   — Mobile money / bank name
-      {bill}       — Bill or fee type
-      {account}    — Account descriptor (may contain sub-slot {provider})
+      {bill}       — Bill or fee type (sub-slots {meter} and {provider} resolved)
+      {account}    — Account descriptor (sub-slot {provider} resolved)
       {ui}         — UI element name
       {item}       — General information noun
       {q}          — Question word
@@ -693,6 +777,9 @@ def fill_slots(template: str, rng: random.Random) -> str:
       {problem}    — Problem description phrase
       {pos_adj}    — Positive adjective phrase
       {neg_adj}    — Negative adjective phrase
+
+    Sub-slot resolution for {bill} and {account} is done eagerly before the
+    main template format() call, using the same pattern so both are consistent.
 
     Raises ValueError on unknown slot names (catches template typos at
     generation time rather than silently producing malformed lines).
@@ -707,14 +794,25 @@ def fill_slots(template: str, rng: random.Random) -> str:
         else raw_account
     )
 
+    # Resolve {bill} — entries may contain {meter} and/or {provider} sub-slots.
+    # Replacement order matters: resolve {meter} first so a hypothetical entry
+    # containing both doesn't leave a stray literal.
+    raw_bill = rng.choice(BILL_TYPES)
+    bill_str  = raw_bill
+    if "{meter}" in bill_str:
+        bill_str = bill_str.replace("{meter}", random_meter(rng))
+    if "{provider}" in bill_str:
+        bill_str = bill_str.replace("{provider}", rng.choice(PROVIDERS))
+
     slots: dict[str, str] = {
         "amt_w":     amt_pair.word,
-        "amt_w_num": amt_pair.numeric,   # FIX: was dead data (amt_pair[1]); now exposed
+        "amt_w_num": amt_pair.numeric,
         "amt_n":     rng.choice(NUMERIC_AMOUNTS),
         "person":    rng.choice(PEOPLE),
         "phone":     random_phone(rng),
+        "meter":     random_meter(rng),   # standalone {meter} in templates
         "provider":  rng.choice(PROVIDERS),
-        "bill":      rng.choice(BILL_TYPES),
+        "bill":      bill_str,            # pre-resolved (sub-slots already expanded)
         "account":   account_str,
         "ui":        rng.choice(UI_ELEMENTS),
         "item":      rng.choice(ITEMS_INFO),
@@ -982,7 +1080,7 @@ def print_quality_report(data: list[str]) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Luganda FastText training data generator v2.1"
+        description="Luganda FastText training data generator v2.2"
     )
     parser.add_argument(
         "--target", type=int, default=1200,
@@ -1006,7 +1104,7 @@ if __name__ == "__main__":
     SEED   = args.seed
     OUTPUT = args.output
 
-    print(f"Luganda Dataset Factory v2.1  —  target={TARGET}, seed={SEED}\n")
+    print(f"Luganda Dataset Factory v2.2  —  target={TARGET}, seed={SEED}\n")
     data = generate_dataset(TARGET, SEED)
 
     # Final shuffle with a different seed to decorrelate from per-label order
